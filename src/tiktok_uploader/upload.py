@@ -19,6 +19,7 @@ from selenium.common.exceptions import (
     ElementClickInterceptedException,
     NoSuchElementException,
     NoSuchShadowRootException,
+    StaleElementReferenceException,
     TimeoutException,
 )
 from selenium.webdriver.common.by import By
@@ -297,6 +298,7 @@ def complete_upload_form(
         _set_cover(driver, cover_path)
     if not skip_split_window:
         _remove_split_window(driver)
+    _remove_joyride_overlay(driver)
     _set_interactivity(driver, **kwargs)
     _set_description(driver, description)
     if visibility != "everyone":
@@ -378,7 +380,21 @@ def _set_description(driver: WebDriver, description: str) -> None:
 
     desc = driver.find_element(By.XPATH, config.selectors.upload.description)
 
-    desc.click()
+    # Try to remove any overlays before clicking
+    try:
+        driver.execute_script("""
+            var overlays = document.querySelectorAll('[class*="overlay"], [class*="joyride"]');
+            overlays.forEach(el => el.remove());
+        """)
+    except:
+        pass
+
+    # Try clicking with JavaScript if normal click fails
+    try:
+        desc.click()
+    except ElementClickInterceptedException:
+        logger.debug("Click intercepted, trying JavaScript click")
+        driver.execute_script("arguments[0].click();", desc)
 
     # desc populates with filename before clearing
     WebDriverWait(driver, config.explicit_wait).until(lambda driver: desc.text != "")
@@ -513,42 +529,85 @@ def _set_video(
 
 def _remove_cookies_window(driver) -> None:
     """
-    Removes the cookies window if it is open
+    Removes the cookies window if it is open - PATCHED VERSION
 
     Parameters
     ----------
     driver : selenium.webdriver
     """
-
     logger.debug(green("Removing cookies window"))
-    cookies_banner = WebDriverWait(driver, config.implicit_wait).until(
-        EC.presence_of_element_located(
-            (By.TAG_NAME, config.selectors.upload.cookies_banner.banner)
-        )
-    )
-
+    
     try:
-        item = WebDriverWait(driver, config.implicit_wait).until(
-            EC.visibility_of(
-                cookies_banner.shadow_root.find_element(
-                    By.CSS_SELECTOR,
-                    config.selectors.upload.cookies_banner.button,
-                )
+        cookies_banner = WebDriverWait(driver, config.implicit_wait).until(
+            EC.presence_of_element_located(
+                (By.TAG_NAME, config.selectors.upload.cookies_banner.banner)
             )
         )
 
-        # Wait that the Decline all button is clickable
-        decline_button = WebDriverWait(driver, config.implicit_wait).until(
-            EC.element_to_be_clickable(item.find_elements(By.TAG_NAME, "button")[0])
-        )
-        decline_button.click()
+        try:
+            item = WebDriverWait(driver, config.implicit_wait).until(
+                EC.visibility_of(
+                    cookies_banner.shadow_root.find_element(
+                        By.CSS_SELECTOR,
+                        config.selectors.upload.cookies_banner.button,
+                    )
+                )
+            )
 
-    # If shadow root is not found, we remove it
-    except NoSuchShadowRootException:
-        driver.execute_script(
-            "document.querySelector(arguments[0]).remove()",
-            config.selectors.upload.cookies_banner.banner,
-        )
+            # Wait that the Decline all button is clickable
+            decline_button = WebDriverWait(driver, config.implicit_wait).until(
+                EC.element_to_be_clickable(item.find_elements(By.TAG_NAME, "button")[0])
+            )
+            decline_button.click()
+            logger.debug(green("Cookies banner closed with click"))
+
+        # If shadow root is not found or stale, remove it with JavaScript
+        except (NoSuchShadowRootException, StaleElementReferenceException, TimeoutException):
+            logger.debug(green("Removing cookies banner with JavaScript"))
+            driver.execute_script(
+                "document.querySelector(arguments[0]).remove()",
+                config.selectors.upload.cookies_banner.banner,
+            )
+            
+    except (TimeoutException, NoSuchElementException):
+        # No banner to remove
+        logger.debug(green("No cookies banner found"))
+        pass
+    except Exception as e:
+        # Other errors - do not block the upload
+        logger.debug(f"Error removing cookies: {e}")
+        try:
+            # Last attempt: hide all possible overlays
+            driver.execute_script("""
+                var overlays = document.querySelectorAll('[class*="cookie"], [class*="banner"], [class*="modal"], [class*="overlay"]');
+                overlays.forEach(el => el.style.display = 'none');
+            """)
+        except:
+            pass
+
+def _remove_joyride_overlay(driver: WebDriver) -> None:
+    """
+    Removes the Joyride tutorial overlay if present
+    
+    Parameters
+    ----------
+    driver : selenium.webdriver
+    """
+    try:
+        logger.debug(green("Checking for Joyride overlay"))
+        # Try to find and remove the Joyride overlay
+        driver.execute_script("""
+            var overlay = document.querySelector('.react-joyride__overlay');
+            if (overlay) {
+                overlay.remove();
+            }
+            // Also remove any other tutorial overlays
+            var tutorials = document.querySelectorAll('[class*="joyride"], [class*="tutorial"], [class*="guide"]');
+            tutorials.forEach(el => el.remove());
+        """)
+        logger.debug(green("Joyride overlay removed"))
+    except Exception as e:
+        logger.debug(f"No Joyride overlay found or error: {e}")
 
 
 def _remove_split_window(driver: WebDriver) -> None:
@@ -595,22 +654,39 @@ def _set_interactivity(
     try:
         logger.debug(green("Setting interactivity settings"))
 
-        comment_box = driver.find_element(By.XPATH, config.selectors.upload.comment)
-        stitch_box = driver.find_element(By.XPATH, config.selectors.upload.stitch)
-        duet_box = driver.find_element(By.XPATH, config.selectors.upload.duet)
+        comment_box = None
+        stitch_box = None
+        duet_box = None
+
+        try:
+            comment_box = driver.find_element(By.XPATH, config.selectors.upload.comment)
+        except NoSuchElementException:
+            logger.debug("Comment selector not found, skipping")
+
+        try:
+            stitch_box = driver.find_element(By.XPATH, config.selectors.upload.stitch)
+        except NoSuchElementException:
+            logger.debug("Stitch selector not found, skipping")
+
+        try:
+            duet_box = driver.find_element(By.XPATH, config.selectors.upload.duet)
+        except NoSuchElementException:
+            logger.debug("Duet selector not found, skipping")
 
         # xor the current state with the desired state
-        if comment ^ comment_box.is_selected():
+        if comment_box and (comment ^ comment_box.is_selected()):
             comment_box.click()
 
-        if stitch ^ stitch_box.is_selected():
+        if stitch_box and (stitch ^ stitch_box.is_selected()):
             stitch_box.click()
 
-        if duet ^ duet_box.is_selected():
+        if duet_box and (duet ^ duet_box.is_selected()):
             duet_box.click()
 
-    except Exception as _:
-        logger.error("Failed to set interactivity settings")
+        logger.debug(green("Interactivity settings completed"))
+
+    except Exception as e:
+        logger.error(f"Failed to set interactivity settings: {e}")
 
 
 def _set_visibility(
