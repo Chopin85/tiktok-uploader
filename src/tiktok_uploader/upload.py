@@ -937,6 +937,28 @@ def _post_video(driver: WebDriver) -> None:
     except TimeoutException:
         logger.debug("No 'Post now' button found, proceeding without it")
 
+    # Handle the French verification modal "Continuer à publier?" / "Publier maintenant"
+    # This modal appears during the verification process
+    try:
+        logger.debug(green("Checking for verification modal (Continuer à publier?)"))
+        # Look for the modal overlay
+        modal_xpath = "//div[contains(@class, 'TUXModal-overlay')]"
+        WebDriverWait(driver, config.implicit_wait).until(
+            EC.presence_of_element_located((By.XPATH, modal_xpath))
+        )
+        logger.debug(green("Verification modal detected"))
+        
+        # Look for the "Publier maintenant" / "Publish now" button within the modal
+        # This button is a TUXButton--primary within the modal
+        publish_now_xpath = "//div[contains(@class, 'TUXModal')]//button[contains(@class, 'TUXButton--primary')]"
+        publish_now_button = WebDriverWait(driver, config.implicit_wait).until(
+            EC.element_to_be_clickable((By.XPATH, publish_now_xpath))
+        )
+        publish_now_button.click()
+        logger.debug(green("Clicked 'Publier maintenant' button in verification modal"))
+    except TimeoutException:
+        logger.debug("No verification modal found, proceeding without it")
+
     # waits for the video to upload
     post_confirmation = EC.presence_of_element_located(
         (By.XPATH, config.selectors.upload.post_confirmation)
